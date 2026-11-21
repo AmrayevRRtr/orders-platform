@@ -1,0 +1,4 @@
+cfn-lint
+moto[dynamodb]
+boto3
+PyYAML
