@@ -1,0 +1,55 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+permissions:
+  id-token: write
+  contents: read
+env:
+  STACK: orders-dev
+  AWS_REGION: eu-central-1
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Lint and tests
+        run: |
+          pip install -r requirements-dev.txt
+          cfn-lint template.yaml
+          python tests/test_all.py
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Build and push image tagged with the commit
+        run: |
+          REPO_URI=$(aws cloudformation describe-stacks --stack-name $STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryUri'].OutputValue" --output text)
+          REPO_NAME=$(aws cloudformation describe-stacks --stack-name $STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='RepositoryName'].OutputValue" --output text)
+          if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag=$GITHUB_SHA >/dev/null 2>&1; then
+            echo "image $GITHUB_SHA already in ECR, skipping push"
+          else
+            aws ecr get-login-password | docker login -u AWS --password-stdin ${REPO_URI%%/*}
+            docker build --platform linux/amd64 -t $REPO_URI:$GITHUB_SHA app
+            docker push $REPO_URI:$GITHUB_SHA
+          fi
+      - name: Deploy the stack with the new image tag
+        run: |
+          aws cloudformation deploy --stack-name $STACK --template-file template.yaml \
+            --parameter-overrides Env=dev ImageTag=$GITHUB_SHA \
+            --capabilities CAPABILITY_IAM --no-fail-on-empty-changeset
+      - name: Smoke test
+        run: |
+          URL=$(aws cloudformation describe-stacks --stack-name $STACK \
+            --query "Stacks[0].Outputs[?OutputKey=='ServiceUrl'].OutputValue" --output text)
+          for i in $(seq 1 12); do
+            curl -fs $URL/health && echo " OK" && exit 0
+            sleep 10
+          done
+          exit 1
